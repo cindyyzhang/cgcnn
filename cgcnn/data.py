@@ -9,10 +9,29 @@ import warnings
 
 import numpy as np
 import torch
-from pymatgen.core.structure import Structure
+from pymatgen.core.structure import Structure, Lattice
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.sampler import SubsetRandomSampler
+
+
+def fourier_encode_positions(positions, freq_num=3, max_freq=3):
+    # positions: Nx3 array of atom positions
+    # freq_num: number of frequencies to use per dimension
+    # max_freq: maximum frequency to consider
+    
+    # Generate frequency vectors
+    freqs = np.arange(1, max_freq+1)[:freq_num]
+    freqs = np.stack(np.meshgrid(freqs, freqs, freqs), -1).reshape(-1, 3)
+    
+    # Compute encodings
+    encodings = np.zeros((positions.shape[0], 2 * freqs.shape[0]))
+    for i, w in enumerate(freqs):
+        phase = 2 * np.pi * positions @ w
+        encodings[:, 2*i] = np.cos(phase)
+        encodings[:, 2*i+1] = np.sin(phase)
+    
+    return encodings
 
 
 def get_train_val_test_loader(dataset, collate_fn=default_collate,
@@ -322,9 +341,18 @@ class CIFData(Dataset):
         cif_id, target = self.id_prop_data[idx]
         crystal = Structure.from_file(os.path.join(self.root_dir,
                                                    cif_id+'.cif'))
+        
+        # Get atom features
         atom_fea = np.vstack([self.ari.get_atom_fea(crystal[i].specie.number)
                               for i in range(len(crystal))])
+        
+        # Concatenate atom features with positional encoding
+        frac_coords = np.array([site.frac_coords for site in crystal])
+        cart_coords = crystal.lattice.get_cartesian_coords(frac_coords)
+        pos_encoding = fourier_encode_positions(frac_coords)
+        atom_fea = np.concatenate([atom_fea, pos_encoding], axis=1)
         atom_fea = torch.Tensor(atom_fea)
+        
         all_nbrs = crystal.get_all_neighbors(self.radius, include_index=True)
         all_nbrs = [sorted(nbrs, key=lambda x: x[1]) for nbrs in all_nbrs]
         nbr_fea_idx, nbr_fea = [], []
