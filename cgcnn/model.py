@@ -2,6 +2,77 @@ from __future__ import print_function, division
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+class SpaceGroupDenseLayer(nn.Module):
+    def __init__(self, input_dim, features, num_space_groups=230):
+        super(SpaceGroupDenseLayer, self).__init__()
+        self.num_space_groups = num_space_groups
+        self.features = features
+        self.input_dim = input_dim
+
+        # Create complex weights and biases for each space group
+        self.weights_real = nn.Parameter(torch.Tensor(num_space_groups, input_dim, features))
+        self.weights_imag = nn.Parameter(torch.Tensor(num_space_groups, input_dim, features))
+        self.bias_real = nn.Parameter(torch.Tensor(num_space_groups, features))
+        self.bias_imag = nn.Parameter(torch.Tensor(num_space_groups, features))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.weights_real)
+        nn.init.xavier_uniform_(self.weights_imag)
+        nn.init.zeros_(self.bias_real)
+        nn.init.zeros_(self.bias_imag)
+
+    def forward(self, inputs, space_group):
+        # Combine real and imaginary parts into complex tensors
+        weights = torch.complex(self.weights_real, self.weights_imag)
+        biases = torch.complex(self.bias_real, self.bias_imag)
+
+        # Select weights and biases for the given space groups
+        selected_weights = weights[space_group].squeeze(1)
+        selected_biases = biases[space_group]
+
+        outputs = torch.einsum('bni,bif->bnf', inputs, selected_weights)
+        outputs = outputs + selected_biases
+
+        return outputs
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, embedding_dim, abc_combinations, graphs_array):
+        super(PositionalEncoding, self).__init__()
+        self.embedding_dim = embedding_dim
+        self.register_buffer('abc_combinations', torch.from_numpy(abc_combinations))
+        self.register_buffer('graphs_array', torch.from_numpy(graphs_array))
+
+        self.norm = nn.LayerNorm(embedding_dim)
+        self.dense1 = SpaceGroupDenseLayer(input_dim=embedding_dim//2,
+                                           features=embedding_dim//2)
+        self.dense2 = nn.Linear(embedding_dim, embedding_dim)
+
+    def forward(self, atom_positions, reciprocal_matrices, space_group):
+        # Compute reciprocal lattice points
+        transformed_abc = torch.matmul(self.abc_combinations.float(), reciprocal_matrices.transpose(1, 2).float())
+
+        # Compute encodings
+        encodings = torch.exp(1j * 2 * torch.pi * torch.matmul(atom_positions, transformed_abc.transpose(1, 2)))
+
+        # Apply adjacency matrices
+        adjacency_matrices = self.graphs_array[space_group.int() - 1].squeeze()
+        weighted_encodings = torch.matmul(encodings, adjacency_matrices)
+
+        # Trim to embedding dimension
+        embedding_dim = self.embedding_dim // 2
+        weighted_encodings = weighted_encodings[:, :, :embedding_dim]
+
+        # Apply dense layers
+        x = self.dense1(weighted_encodings, space_group.int() - 1)
+        x = torch.cat([x.real, x.imag], dim=-1)
+        x = F.silu(x)
+        x = self.dense2(x)
+
+        return self.norm(x)
 
 
 class ConvLayer(nn.Module):
@@ -11,10 +82,8 @@ class ConvLayer(nn.Module):
     def __init__(self, atom_fea_len, nbr_fea_len):
         """
         Initialize ConvLayer.
-
         Parameters
         ----------
-
         atom_fea_len: int
           Number of atom hidden features.
         nbr_fea_len: int
@@ -32,45 +101,33 @@ class ConvLayer(nn.Module):
         self.softplus2 = nn.Softplus()
 
     def forward(self, atom_in_fea, nbr_fea, nbr_fea_idx):
-        """
-        Forward pass
+        B, A, _ = atom_in_fea.shape
+        _, _, M, _ = nbr_fea.shape
 
-        N: Total number of atoms in the batch
-        M: Max number of neighbors
+        # Reshape input for original-style computation
+        atom_in_fea_reshaped = atom_in_fea.view(B*A, -1)
+        nbr_fea_reshaped = nbr_fea.view(B*A, M, -1)
+        nbr_fea_idx_reshaped = nbr_fea_idx.view(B*A, M)
 
-        Parameters
-        ----------
-
-        atom_in_fea: Variable(torch.Tensor) shape (N, atom_fea_len)
-          Atom hidden features before convolution
-        nbr_fea: Variable(torch.Tensor) shape (N, M, nbr_fea_len)
-          Bond features of each atom's M neighbors
-        nbr_fea_idx: torch.LongTensor shape (N, M)
-          Indices of M neighbors of each atom
-
-        Returns
-        -------
-
-        atom_out_fea: nn.Variable shape (N, atom_fea_len)
-          Atom hidden features after convolution
-
-        """
-        # TODO will there be problems with the index zero padding?
-        N, M = nbr_fea_idx.shape
-        # convolution
-        atom_nbr_fea = atom_in_fea[nbr_fea_idx, :]
+        # Original-style convolution
+        atom_nbr_fea = atom_in_fea_reshaped[nbr_fea_idx_reshaped, :]
         total_nbr_fea = torch.cat(
-            [atom_in_fea.unsqueeze(1).expand(N, M, self.atom_fea_len),
-             atom_nbr_fea, nbr_fea], dim=2)
+            [atom_in_fea_reshaped.unsqueeze(1).expand(B*A, M, self.atom_fea_len),
+             atom_nbr_fea, nbr_fea_reshaped], dim=2)
+        
         total_gated_fea = self.fc_full(total_nbr_fea)
         total_gated_fea = self.bn1(total_gated_fea.view(
-            -1, self.atom_fea_len*2)).view(N, M, self.atom_fea_len*2)
+            -1, self.atom_fea_len*2)).view(B*A, M, self.atom_fea_len*2)
         nbr_filter, nbr_core = total_gated_fea.chunk(2, dim=2)
         nbr_filter = self.sigmoid(nbr_filter)
         nbr_core = self.softplus1(nbr_core)
         nbr_sumed = torch.sum(nbr_filter * nbr_core, dim=1)
         nbr_sumed = self.bn2(nbr_sumed)
-        out = self.softplus2(atom_in_fea + nbr_sumed)
+        out = self.softplus2(atom_in_fea_reshaped + nbr_sumed)
+
+        # Reshape output back to batched format
+        out = out.view(B, A, -1)
+
         return out
 
 
@@ -81,7 +138,7 @@ class CrystalGraphConvNet(nn.Module):
     """
     def __init__(self, orig_atom_fea_len, nbr_fea_len,
                  atom_fea_len=64, n_conv=3, h_fea_len=128, n_h=1,
-                 classification=False):
+                 classification=False, graphs_array=None, abc_combinations=None):
         """
         Initialize CrystalGraphConvNet.
 
@@ -104,6 +161,7 @@ class CrystalGraphConvNet(nn.Module):
         super(CrystalGraphConvNet, self).__init__()
         self.classification = classification
         self.embedding = nn.Linear(orig_atom_fea_len, atom_fea_len)
+        self.positional_encoding = PositionalEncoding(atom_fea_len, abc_combinations, graphs_array)
         self.convs = nn.ModuleList([ConvLayer(atom_fea_len=atom_fea_len,
                                     nbr_fea_len=nbr_fea_len)
                                     for _ in range(n_conv)])
@@ -122,7 +180,7 @@ class CrystalGraphConvNet(nn.Module):
             self.logsoftmax = nn.LogSoftmax(dim=1)
             self.dropout = nn.Dropout()
 
-    def forward(self, atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx):
+    def forward(self, atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx, atom_positions, reciprocal_matrices, space_group):
         """
         Forward pass
 
@@ -150,6 +208,7 @@ class CrystalGraphConvNet(nn.Module):
 
         """
         atom_fea = self.embedding(atom_fea)
+        atom_fea = atom_fea + self.positional_encoding(atom_positions, reciprocal_matrices, space_group)
         for conv_func in self.convs:
             atom_fea = conv_func(atom_fea, nbr_fea, nbr_fea_idx)
         crys_fea = self.pooling(atom_fea, crystal_atom_idx)

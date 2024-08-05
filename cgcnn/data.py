@@ -9,30 +9,11 @@ import warnings
 
 import numpy as np
 import torch
-from pymatgen.core.structure import Structure, Lattice
+from pymatgen.core.structure import Structure
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.sampler import SubsetRandomSampler
-
-
-def fourier_encode_positions(positions, freq_num=3, max_freq=3):
-    # positions: Nx3 array of atom positions
-    # freq_num: number of frequencies to use per dimension
-    # max_freq: maximum frequency to consider
-    
-    # Generate frequency vectors
-    freqs = np.arange(1, max_freq+1)[:freq_num]
-    freqs = np.stack(np.meshgrid(freqs, freqs, freqs), -1).reshape(-1, 3)
-    
-    # Compute encodings
-    encodings = np.zeros((positions.shape[0], 2 * freqs.shape[0]))
-    for i, w in enumerate(freqs):
-        phase = 2 * np.pi * positions @ w
-        encodings[:, 2*i] = np.cos(phase)
-        encodings[:, 2*i+1] = np.sin(phase)
-    
-    return encodings
-
 
 def get_train_val_test_loader(dataset, collate_fn=default_collate,
                               batch_size=64, train_ratio=None,
@@ -150,8 +131,9 @@ def collate_pool(dataset_list):
     batch_atom_fea, batch_nbr_fea, batch_nbr_fea_idx = [], [], []
     crystal_atom_idx, batch_target = [], []
     batch_cif_ids = []
+    batch_frac_coords, batch_reciprocal_matrix, batch_space_group = [], [], []
     base_idx = 0
-    for i, ((atom_fea, nbr_fea, nbr_fea_idx), target, cif_id)\
+    for i, ((atom_fea, nbr_fea, nbr_fea_idx), (frac_coords, reciprocal_matrix, space_group), target, cif_id)\
             in enumerate(dataset_list):
         n_i = atom_fea.shape[0]  # number of atoms for this crystal
         batch_atom_fea.append(atom_fea)
@@ -159,13 +141,19 @@ def collate_pool(dataset_list):
         batch_nbr_fea_idx.append(nbr_fea_idx+base_idx)
         new_idx = torch.LongTensor(np.arange(n_i)+base_idx)
         crystal_atom_idx.append(new_idx)
+        batch_frac_coords.append(frac_coords)
+        batch_reciprocal_matrix.append(reciprocal_matrix)
+        batch_space_group.append(space_group)
         batch_target.append(target)
         batch_cif_ids.append(cif_id)
         base_idx += n_i
-    return (torch.cat(batch_atom_fea, dim=0),
-            torch.cat(batch_nbr_fea, dim=0),
-            torch.cat(batch_nbr_fea_idx, dim=0),
+    return [(torch.stack(batch_atom_fea, dim=0),
+            torch.stack(batch_nbr_fea, dim=0),
+            torch.stack(batch_nbr_fea_idx, dim=0),
             crystal_atom_idx),\
+        (torch.stack(batch_frac_coords, dim=0),
+         torch.stack(batch_reciprocal_matrix, dim=0),
+         torch.stack(batch_space_group, dim=0))],\
         torch.stack(batch_target, dim=0),\
         batch_cif_ids
 
@@ -332,49 +320,67 @@ class CIFData(Dataset):
         assert os.path.exists(atom_init_file), 'atom_init.json does not exist!'
         self.ari = AtomCustomJSONInitializer(atom_init_file)
         self.gdf = GaussianDistance(dmin=dmin, dmax=self.radius, step=step)
+        self.max_atoms = 444
+        print("Max atoms: ", self.max_atoms)
+
+    def _find_max_atoms(self):
+        max_atoms = 0
+        for cif_id, _ in self.id_prop_data:
+            crystal = Structure.from_file(os.path.join(self.root_dir, cif_id+'.cif'))
+            num_atoms = len(crystal)
+            if num_atoms > max_atoms:
+                max_atoms = num_atoms
+        return max_atoms
 
     def __len__(self):
         return len(self.id_prop_data)
 
-    @functools.lru_cache(maxsize=None)  # Cache loaded structures
+    @functools.lru_cache(maxsize=None)
     def __getitem__(self, idx):
         cif_id, target = self.id_prop_data[idx]
-        crystal = Structure.from_file(os.path.join(self.root_dir,
-                                                   cif_id+'.cif'))
+        crystal = Structure.from_file(os.path.join(self.root_dir, cif_id+'.cif'))
+        space_group = SpacegroupAnalyzer(crystal).get_space_group_number()
+        reciprocal_matrix = crystal.lattice.reciprocal_lattice_crystallographic.matrix
         
         # Get atom features
-        atom_fea = np.vstack([self.ari.get_atom_fea(crystal[i].specie.number)
+        atom_fea = np.array([self.ari.get_atom_fea(crystal[i].specie.number)
                               for i in range(len(crystal))])
+        atom_fea = np.pad(atom_fea, ((0, self.max_atoms - len(atom_fea)), (0, 0)), mode='constant')
         
-        # Concatenate atom features with positional encoding
-        frac_coords = np.array([site.frac_coords for site in crystal])
-        cart_coords = crystal.lattice.get_cartesian_coords(frac_coords)
-        pos_encoding = fourier_encode_positions(frac_coords)
-        atom_fea = np.concatenate([atom_fea, pos_encoding], axis=1)
-        atom_fea = torch.Tensor(atom_fea)
+        frac_coords = np.array([site.frac_coords for site in crystal])     
+        frac_coords = np.pad(frac_coords, ((0, self.max_atoms - len(frac_coords)), (0, 0)), 
+                     mode='constant')
         
         all_nbrs = crystal.get_all_neighbors(self.radius, include_index=True)
         all_nbrs = [sorted(nbrs, key=lambda x: x[1]) for nbrs in all_nbrs]
         nbr_fea_idx, nbr_fea = [], []
         for nbr in all_nbrs:
             if len(nbr) < self.max_num_nbr:
-                warnings.warn('{} not find enough neighbors to build graph. '
-                              'If it happens frequently, consider increase '
-                              'radius.'.format(cif_id))
+                warnings.warn(f'{cif_id} not find enough neighbors to build graph. '
+                              'If it happens frequently, consider increase radius.')
                 nbr_fea_idx.append(list(map(lambda x: x[2], nbr)) +
                                    [0] * (self.max_num_nbr - len(nbr)))
                 nbr_fea.append(list(map(lambda x: x[1], nbr)) +
-                               [self.radius + 1.] * (self.max_num_nbr -
-                                                     len(nbr)))
+                               [self.radius + 1.] * (self.max_num_nbr - len(nbr)))
             else:
-                nbr_fea_idx.append(list(map(lambda x: x[2],
-                                            nbr[:self.max_num_nbr])))
-                nbr_fea.append(list(map(lambda x: x[1],
-                                        nbr[:self.max_num_nbr])))
-        nbr_fea_idx, nbr_fea = np.array(nbr_fea_idx), np.array(nbr_fea)
+                nbr_fea_idx.append(list(map(lambda x: x[2], nbr[:self.max_num_nbr])))
+                nbr_fea.append(list(map(lambda x: x[1], nbr[:self.max_num_nbr])))
+        
+        # Pad nbr_fea and nbr_fea_idx to match max_atoms
+        num_atoms = len(crystal)
+        padding = self.max_atoms - num_atoms
+        nbr_fea_idx = np.pad(nbr_fea_idx, ((0, padding), (0, 0)), mode='constant')
+        nbr_fea = np.pad(nbr_fea, ((0, padding), (0, 0)), mode='constant')
+        
         nbr_fea = self.gdf.expand(nbr_fea)
+        
         atom_fea = torch.Tensor(atom_fea)
         nbr_fea = torch.Tensor(nbr_fea)
         nbr_fea_idx = torch.LongTensor(nbr_fea_idx)
+        frac_coords = torch.Tensor(frac_coords)
+        reciprocal_matrix = torch.Tensor(reciprocal_matrix)
+        space_group = torch.Tensor([space_group])
+        # log_target = np.log(np.abs(float(target)) + epsilon)
         target = torch.Tensor([float(target)])
-        return (atom_fea, nbr_fea, nbr_fea_idx), target, cif_id
+
+        return (atom_fea, nbr_fea, nbr_fea_idx), (frac_coords, reciprocal_matrix, space_group), target, cif_id

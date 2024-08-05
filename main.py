@@ -4,12 +4,14 @@ import shutil
 import sys
 import time
 import warnings
+import wandb
 from random import sample
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from scipy.linalg import norm 
 from sklearn import metrics
 from torch.autograd import Variable
 from torch.optim.lr_scheduler import MultiStepLR
@@ -29,11 +31,11 @@ parser.add_argument('--disable-cuda', action='store_true',
                     help='Disable CUDA')
 parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                     help='number of data loading workers (default: 0)')
-parser.add_argument('--epochs', default=30, type=int, metavar='N',
+parser.add_argument('--epochs', default=70, type=int, metavar='N',
                     help='number of total epochs to run (default: 30)')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=32, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
                     metavar='LR', help='initial learning rate (default: '
@@ -81,6 +83,7 @@ parser.add_argument('--n-h', default=1, type=int, metavar='N',
 args = parser.parse_args(sys.argv[1:])
 
 args.cuda = not args.disable_cuda and torch.cuda.is_available()
+print(f"CUDA: {args.cuda}")
 
 if args.task == 'regression':
     best_mae_error = 1e10
@@ -91,7 +94,18 @@ else:
 def main():
     global args, best_mae_error
 
+    #wandb.init(project="cgcnn-formation", config=vars(args))
+
     # load data
+    radius = 5
+    graphs_array = np.load('graphs.npy')
+    abc_combinations = np.array([
+            (float(a), float(b), float(c))
+            for a in range(-int(radius), int(radius)+1)
+            for b in range(-int(radius), int(radius)+1)
+            for c in range(-int(radius), int(radius)+1)
+            if norm([a, b, c]) <= radius
+        ])
     dataset = CIFData(*args.data_options)
     collate_fn = collate_pool
     train_loader, val_loader, test_loader = get_train_val_test_loader(
@@ -113,6 +127,7 @@ def main():
         normalizer = Normalizer(torch.zeros(2))
         normalizer.load_state_dict({'mean': 0., 'std': 1.})
     else:
+        print(f"Dataset size: {len(dataset)}")
         if len(dataset) < 500:
             warnings.warn('Dataset has less than 500 data points. '
                           'Lower accuracy is expected. ')
@@ -124,7 +139,7 @@ def main():
         normalizer = Normalizer(sample_target)
 
     # build model
-    structures, _, _ = dataset[0]
+    structures, _, _, _ = dataset[0]
     orig_atom_fea_len = structures[0].shape[-1]
     nbr_fea_len = structures[1].shape[-1]
     model = CrystalGraphConvNet(orig_atom_fea_len, nbr_fea_len,
@@ -132,8 +147,9 @@ def main():
                                 n_conv=args.n_conv,
                                 h_fea_len=args.h_fea_len,
                                 n_h=args.n_h,
-                                classification=True if args.task ==
-                                                       'classification' else False)
+                                classification=True if args.task == 'classification' else False,
+                                graphs_array=graphs_array,
+                                abc_combinations=abc_combinations)
     if args.cuda:
         model.cuda()
 
@@ -228,15 +244,25 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
         data_time.update(time.time() - end)
 
         if args.cuda:
-            input_var = (Variable(input[0].cuda(non_blocking=True)),
-                         Variable(input[1].cuda(non_blocking=True)),
-                         input[2].cuda(non_blocking=True),
-                         [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]])
+            input_var = (
+                Variable(input[0][0].cuda(non_blocking=True)),  # atom_fea
+                Variable(input[0][1].cuda(non_blocking=True)),  # nbr_fea
+                input[0][2].cuda(non_blocking=True),            # nbr_fea_idx
+                [crys_idx.cuda(non_blocking=True) for crys_idx in input[0][3]],  # crystal_atom_idx
+                Variable(input[1][0].cuda(non_blocking=True)),  # frac_coords
+                Variable(input[1][1].cuda(non_blocking=True)),  # reciprocal_matrices
+                Variable(input[1][2].cuda(non_blocking=True))   # space_group
+            )
         else:
-            input_var = (Variable(input[0]),
-                         Variable(input[1]),
-                         input[2],
-                         input[3])
+            input_var = (
+                Variable(input[0][0]),  # atom_fea
+                Variable(input[0][1]),  # nbr_fea
+                input[0][2],            # nbr_fea_idx
+                input[0][3],               # crystal_atom_idx
+                Variable(input[1][0]),  # frac_coords
+                Variable(input[1][1]),  # reciprocal_matrices
+                Variable(input[1][2])   # space_group
+            )
         # normalize target
         if args.task == 'regression':
             target_normed = normalizer.norm(target)
@@ -256,6 +282,7 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
             mae_error = mae(normalizer.denorm(output.data.cpu()), target)
             losses.update(loss.data.cpu(), target.size(0))
             mae_errors.update(mae_error, target.size(0))
+            #wandb.log({"epoch": epoch, "train_loss": losses.avg, "train_mae": mae_errors.avg})
         else:
             accuracy, precision, recall, fscore, auc_score = \
                 class_eval(output.data.cpu(), target)
@@ -325,16 +352,26 @@ def validate(val_loader, model, criterion, normalizer, test=False):
     for i, (input, target, batch_cif_ids) in enumerate(val_loader):
         if args.cuda:
             with torch.no_grad():
-                input_var = (Variable(input[0].cuda(non_blocking=True)),
-                             Variable(input[1].cuda(non_blocking=True)),
-                             input[2].cuda(non_blocking=True),
-                             [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]])
+                input_var = (
+                    Variable(input[0][0].cuda(non_blocking=True)),  # atom_fea
+                    Variable(input[0][1].cuda(non_blocking=True)),  # nbr_fea
+                    input[0][2].cuda(non_blocking=True),            # nbr_fea_idx
+                    [crys_idx.cuda(non_blocking=True) for crys_idx in input[0][3]],  # crystal_atom_idx
+                    Variable(input[1][0].cuda(non_blocking=True)),  # frac_coords
+                    Variable(input[1][1].cuda(non_blocking=True)),  # reciprocal_matrices
+                    Variable(input[1][2].cuda(non_blocking=True))   # space_group
+                )
         else:
             with torch.no_grad():
-                input_var = (Variable(input[0]),
-                             Variable(input[1]),
-                             input[2],
-                             input[3])
+                input_var = (
+                    Variable(input[0][0]),  # atom_fea
+                    Variable(input[0][1]),  # nbr_fea
+                    input[0][2],            # nbr_fea_idx
+                    input[0][3],               # crystal_atom_idx
+                    Variable(input[1][0]),  # frac_coords
+                    Variable(input[1][1]),  # reciprocal_matrices
+                    Variable(input[1][2])   # space_group
+                )
         if args.task == 'regression':
             target_normed = normalizer.norm(target)
         else:
@@ -355,6 +392,7 @@ def validate(val_loader, model, criterion, normalizer, test=False):
             mae_error = mae(normalizer.denorm(output.data.cpu()), target)
             losses.update(loss.data.cpu().item(), target.size(0))
             mae_errors.update(mae_error, target.size(0))
+            #wandb.log({"val_loss": losses.avg, "val_mae": mae_errors.avg})
             if test:
                 test_pred = normalizer.denorm(output.data.cpu())
                 test_target = target
@@ -390,6 +428,7 @@ def validate(val_loader, model, criterion, normalizer, test=False):
                       'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'.format(
                     i, len(val_loader), batch_time=batch_time, loss=losses,
                     mae_errors=mae_errors))
+                #wandb.log({"test_loss": losses.avg, "test_mae": mae_errors.avg})
             else:
                 print('Test: [{0}/{1}]\t'
                       'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
